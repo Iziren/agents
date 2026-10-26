@@ -49,6 +49,7 @@ from ..llm.tool_context import (
     ANSWERS_KEY,
     ASK_IN_OWN_WORDS,
     DELIVERED,
+    TASK_KEY,
     Completed,
     Failed,
     InputRequired,
@@ -113,7 +114,9 @@ class RunHooks:
     turn's question came from a call of it that relays answers, a delegate's, and this message
     is its answer. ``delegated`` says the turn's message came from another agent: the run does
     not phrase its questions, the agent facing the person does. ``lane`` is the door's lane of
-    the thread, what ``A2ADelegate`` names as the caller's.
+    the thread, what ``A2ADelegate`` names as the caller's. ``task_id`` is the task the turn
+    runs under, which marks what the run records (``TASK_KEY``); ``open_tasks`` are the lane's
+    other open tasks, whose items after this task's own last one the model does not read.
     """
 
     boundary: Callable[[], Awaitable[bool]] | None = None
@@ -127,6 +130,8 @@ class RunHooks:
     answer_tool: str | None = None
     delegated: bool = False
     lane: str | None = None
+    task_id: str | None = None
+    open_tasks: frozenset[str] = frozenset()
 
 
 _run_hooks = contextvars.ContextVar[RunHooks | None]("agents_run_hooks", default=None)
@@ -195,6 +200,8 @@ class AgentRun(Generic[Run_T]):
         self._message = message
         self._result: RunResult[Run_T] | None = None
         self._on_token: Callable[[str], Awaitable[None]] | None = None
+        # what the lane's other open tasks added that this run's model does not read
+        self._hidden: frozenset[str] = frozenset()
 
     async def __aiter__(self) -> AsyncIterator[str]:
         if self._result is not None:
@@ -378,8 +385,30 @@ class AgentRun(Generic[Run_T]):
         # not part of it
         new_items: list[ChatItem] = []
         hooks = None if self._nested else _run_hooks.get()
+        task_id = hooks.task_id if hooks is not None else None
+        if hooks is not None and hooks.open_tasks:
+            # the model reads none of what the lane's other open tasks added after this task's
+            # own last item: work the continued task did not see when it paused. An output
+            # belongs to its call's task
+            call_tasks: dict[str, Any] = {}
+            tasks: list[Any] = []
+            for item in chat_ctx.items:
+                task = (
+                    call_tasks.get(item.call_id) if isinstance(item, FunctionCallOutput) else None
+                )
+                if isinstance(item, (ChatMessage, FunctionCall)):
+                    task = item.extra.get(TASK_KEY)
+                if isinstance(item, FunctionCall):
+                    call_tasks[item.call_id] = task
+                tasks.append(task)
+            own = [n for n, task in enumerate(tasks) if task == task_id]
+            if own:
+                after = zip(chat_ctx.items[own[-1] + 1 :], tasks[own[-1] + 1 :], strict=True)
+                self._hidden = frozenset(i.id for i, task in after if task in hooks.open_tasks)
 
         def record(item: ChatItem) -> None:
+            if task_id is not None and isinstance(item, (ChatMessage, FunctionCall)):
+                item.extra.setdefault(TASK_KEY, task_id)
             chat_ctx.insert(item)
             new_items.append(item)
             if hooks is not None and hooks.on_item is not None:
@@ -411,21 +440,26 @@ class AgentRun(Generic[Run_T]):
             return result
 
         async def ask(
-            q: InputRequired, fnc_call: FunctionCall | None, relays: bool = False
+            questions: Sequence[tuple[InputRequired, FunctionCall | None, bool]],
         ) -> RunResult[Run_T]:
-            """The turn waits on the person: the question as written when verbatim or when
-            another agent asked, else in the agent's own words, after what the turn told them
-            already. It is exact as a whole only when every part is. ``relays`` says the call's
-            tool takes the answer itself, as a delegate's does."""
-            # what a delegate's expert said as written before its question
-            shown.extend((said, True) for said in getattr(q, "_said", ()))
-            text = q.question
-            if not q.verbatim and facing_person:
+            """The task pauses once, on one question that holds what each call of the step
+            asked, in order and each once: as written when every part is verbatim or another
+            agent asked, else in the agent's own words, after what the turn told the person
+            already. It is exact as a whole only when every part is. Each entry is a question,
+            its call, and whether that call relays the answer."""
+            for q, _, _ in questions:
+                # what a delegate's expert said as written before its question
+                shown.extend((said, True) for said in getattr(q, "_said", ()))
+            text = "\n\n".join(dict.fromkeys(q.question for q, _, _ in questions))
+            verbatim = all(q.verbatim for q, _, _ in questions)
+            if not verbatim and facing_person:
                 text = await self._phrase(chat_ctx, text)
             record(ChatMessage(role="assistant", content=[text]))
-            result._pending_call = fnc_call
-            result._answer_tool = fnc_call.name if relays and fnc_call is not None else None
-            parts = [*shown, (text, q.verbatim)]
+            # the call the question's row names: a delegate's, when one relays the answer
+            relay = next((call for _, call, relays in questions if relays), None)
+            result._pending_call = relay or questions[0][1]
+            result._answer_tool = relay.name if relay is not None else None
+            parts = [*shown, (text, verbatim)]
             ended = finish(None, input_required="\n\n".join(piece for piece, _ in parts))
             result._segments = parts if len(parts) > 1 else None
             if all(exact for _, exact in parts):
@@ -461,7 +495,7 @@ class AgentRun(Generic[Run_T]):
                 text = transition.error if isinstance(transition, Failed) else transition.reason
                 self._pop(ToolError(text), record)
             elif isinstance(transition, InputRequired):
-                return await ask(transition, fnc_call)
+                return await ask([(transition, fnc_call, False)])
             elif isinstance(transition, Working):
                 logger.warning(
                     "Working is not applied in text yet; the task keeps the conversation",
@@ -508,7 +542,7 @@ class AgentRun(Generic[Run_T]):
             else:
                 on_token = self._on_token or (hooks.on_token if hooks is not None else None)
                 text, calls, usage = await self._infer(
-                    _without_pending_calls(chat_ctx), tool_ctx, on_token=on_token
+                    _without_pending_calls(chat_ctx, self._hidden), tool_ctx, on_token=on_token
                 )
                 self._usage._add_completion(usage)
 
@@ -529,6 +563,8 @@ class AgentRun(Generic[Run_T]):
                     continue
                 return finish(text)
 
+            # the step's questions are asked as one, once all its calls ran
+            questions: list[tuple[InputRequired, FunctionCall | None, bool]] = []
             for i, fnc_call in enumerate(calls):
                 self._usage.tool_calls += 1
                 record(fnc_call)
@@ -574,7 +610,7 @@ class AgentRun(Generic[Run_T]):
                     out.fnc_call_out.output = delivered(said).output
                 record(out.fnc_call_out)
                 if isinstance(said, ToolResult) and said.verbatim and not said.reply_required:
-                    return finish(None)
+                    return await ask(questions) if questions else finish(None)
 
                 if out.transition is not None and isinstance(agent, AgentTask):
                     if (ended := await act(out.transition, fnc_call)) is not None:
@@ -582,7 +618,7 @@ class AgentRun(Generic[Run_T]):
                     if not isinstance(out.transition, Working):
                         break  # the task ended, or it asked; the agent below speaks next
                 elif isinstance(out.transition, InputRequired):
-                    return await ask(out.transition, fnc_call, relays_answer(tool))
+                    questions.append((out.transition, fnc_call, relays_answer(tool)))
                 elif out.transition is not None:
                     logger.warning(
                         "a conversation tool returned a transition that only an AgentTask "
@@ -592,7 +628,9 @@ class AgentRun(Generic[Run_T]):
                 if out.agent_task is not None:
                     self._hand_off(out.agent_task, record)
                 if isinstance(out.raw_exception, StopResponse):
-                    return finish(None)
+                    return await ask(questions) if questions else finish(None)
+            if questions:
+                return await ask(questions)
 
         raise UnexpectedModelBehavior(
             f"run `{self._id}` did not finish within {self._max_steps} steps"
@@ -612,7 +650,9 @@ class AgentRun(Generic[Run_T]):
             modality="text",
         )
         ctx.add_message(role="system", content=ASK_IN_OWN_WORDS.format(question=question))
-        text, _, usage = await self._infer(_without_pending_calls(ctx), ToolContext([]))
+        text, _, usage = await self._infer(
+            _without_pending_calls(ctx, self._hidden), ToolContext([])
+        )
         self._usage._add_completion(usage)
         return text.strip() or question
 
@@ -792,17 +832,20 @@ class AgentRun(Generic[Run_T]):
             return None, f"invalid {FINAL_RESULT_TOOL}: {e}"
 
 
-def _without_pending_calls(chat_ctx: ChatContext) -> ChatContext:
+def _without_pending_calls(
+    chat_ctx: ChatContext, hidden: frozenset[str] = frozenset()
+) -> ChatContext:
     """The history as the model reads it: a call still waiting on a task has no output yet,
     and a request cannot carry one, so it is left out until the task completes; an answered
-    read-back says the call has not run."""
+    read-back says the call has not run; the ``hidden`` items of other open tasks are left out."""
     answered = {item.call_id for item in chat_ctx.items if isinstance(item, FunctionCallOutput)}
     pending = [
         item
         for item in chat_ctx.items
         if isinstance(item, FunctionCall) and item.call_id not in answered
     ]
-    return ChatContext(as_model_reads([item for item in chat_ctx.items if item not in pending]))
+    kept = [item for item in chat_ctx.items if item not in pending and item.id not in hidden]
+    return ChatContext(as_model_reads(kept))
 
 
 def _tool_text(value: Any) -> str:
