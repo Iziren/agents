@@ -1563,10 +1563,14 @@ async def test_a_caller_the_service_cannot_hear_loses_the_turn_to_the_pause(
         for _ in range(20):
             session.push_audio(_silence(100))
         session._handle_event(_transcript("user", " My date of birth is June", 1800))
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100) + 1):
+            session.push_audio(_pcm(0.05))
         session.mute_input()
 
-        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100) - 1):
             session.push_audio(_pcm(0.05))
+        assert "input_speech_stopped" not in [name for name, _ in events]
+        session.push_audio(_pcm(0.05))
         assert [name for name, _ in events[-2:]] == [
             "input_audio_transcription_completed",
             "input_speech_stopped",
@@ -1580,7 +1584,7 @@ async def test_a_line_that_got_noisier_still_ends_the_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The gate holds open on noise above the floor it learned, so fragments stopping must end
-    the turn on their own."""
+    the turn on their own, and the next turn ends on the pause again."""
     _connect_hook(monkeypatch)
 
     model = GPTLiveModel(api_key="sk-test")
@@ -1593,8 +1597,11 @@ async def test_a_line_that_got_noisier_still_ends_the_turn(
             session.push_audio(_pcm(0.001))
         session._handle_event(_transcript("user", " My date of birth is June", 1800))
         session.push_audio(_pcm(0.05))
+        for _ in range(20):
+            session.push_audio(_pcm(0.005))
+        session._handle_event(_transcript("user", " sixth", 2200))
 
-        for _ in range(int(gpt_live_model._MAX_FRAGMENT_GAP_MS // 100) - 2):
+        for _ in range(int(gpt_live_model._MAX_FRAGMENT_GAP_MS // 100) - 1):
             session.push_audio(_pcm(0.005))
         assert "input_speech_stopped" not in [name for name, _ in events]
         session.push_audio(_pcm(0.005))
@@ -1602,6 +1609,15 @@ async def test_a_line_that_got_noisier_still_ends_the_turn(
             "input_audio_transcription_completed",
             "input_speech_stopped",
         ]
+
+        session._handle_event(_transcript("user", " Yes", 9000))
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+            session.push_audio(_pcm(0.005))
+        assert [name for name, _ in events[-2:]] == [
+            "input_audio_transcription_completed",
+            "input_speech_stopped",
+        ]
+        assert [name for name, _ in events].count("input_speech_stopped") == 2
     finally:
         await session.aclose()
         await model.aclose()

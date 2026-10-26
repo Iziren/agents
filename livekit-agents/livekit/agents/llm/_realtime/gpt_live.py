@@ -1075,9 +1075,11 @@ class GPTLiveSession(
         audible = self._input_gate.update(frame) and not self._input_muted
         if (speech := self._speech.get("user")) is not None:
             speech.quiet_ms += round(frame.duration * 1000)
-            if (
-                speech.quiet_ms >= _MIN_SILENCE_MS and not audible
-            ) or speech.quiet_ms >= _MAX_FRAGMENT_GAP_MS:
+            if speech.quiet_ms >= _MAX_FRAGMENT_GAP_MS:
+                # only an open gate gets here: it relearns the line's floor from what it carries now
+                self._input_gate = llm.AdaptiveNoiseGate(min_silence_duration=_MIN_SILENCE_DURATION)
+                self._end_speech("user")
+            elif speech.quiet_ms >= _MIN_SILENCE_MS and not audible:
                 self._end_speech("user")
 
         if self._input_resampler and frame.sample_rate != self._input_resampler._input_rate:
@@ -1131,6 +1133,9 @@ class GPTLiveSession(
         The state is remembered and re-applied to any session a reconnect opens.
         """
         self._input_muted = True
+        # the service hears silence only from here, not over what was pushed before
+        if (speech := self._speech.get("user")) is not None:
+            speech.quiet_ms = 0
         self.send_event(types.InputAudioMuteEvent(event_id=utils.shortuuid("mute_")))
 
     def unmute_input(self) -> None:
