@@ -1515,6 +1515,39 @@ async def test_the_callers_turn_ends_on_their_own_audio(monkeypatch: pytest.Monk
         await model.aclose()
 
 
+async def test_a_caller_still_talking_keeps_the_turn_between_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fragments arrive about as far apart as the pause, so the gap between them is not silence:
+    a caller still audible past it keeps the turn, and their pause afterwards ends it."""
+    _connect_hook(monkeypatch)
+
+    model = GPTLiveModel(api_key="sk-test")
+    session = model.session()
+    events = _user_events(session)
+    try:
+        await session._update_session()
+        await asyncio.sleep(0.05)
+        for _ in range(20):
+            session.push_audio(_silence(100))
+        session._handle_event(_transcript("user", " My date of birth is June", 1800))
+
+        for _ in range(2 * int(gpt_live_model._MIN_SILENCE_MS // 100)):
+            session.push_audio(_pcm(0.05))
+        assert "input_speech_stopped" not in [name for name, _ in events]
+
+        # within a frame of the pause
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100) + 1):
+            session.push_audio(_pcm(0.0))
+        assert [name for name, _ in events[-2:]] == [
+            "input_audio_transcription_completed",
+            "input_speech_stopped",
+        ]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
 async def test_a_pause_on_the_models_clock_splits_fragments_that_arrive_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -417,6 +417,8 @@ class GPTLiveSession(
         # reconnect; the framework's chat context is the adapter's, not this
         self._history = llm.ChatContext.empty()
         self._speech: dict[Role, _Speech] = {}
+        # learns the caller's own noise floor, so a noisy line still has a silence to measure
+        self._input_gate = llm.AdaptiveNoiseGate(min_silence_duration=_MIN_SILENCE_DURATION)
 
         # delegation_id -> call_ids of its response that has not completed yet; on completion the
         # call_ids move to the open set, and stay there until each output is sent to the backend.
@@ -1064,10 +1066,13 @@ class GPTLiveSession(
         return self._tools.copy()
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
-        # the caller's turn ends on their own audio: this much pushed since their last fragment
+        # the caller's turn ends on their own audio: this much pushed since their last fragment,
+        # with the gate closed. fragments arrive about as far apart as the pause, so their
+        # spacing alone would split a caller mid-sentence
+        audible = self._input_gate.update(frame)
         if (speech := self._speech.get("user")) is not None:
             speech.quiet_ms += round(frame.duration * 1000)
-            if speech.quiet_ms >= _MIN_SILENCE_MS:
+            if speech.quiet_ms >= _MIN_SILENCE_MS and not audible:
                 self._end_speech("user")
 
         if self._input_resampler and frame.sample_rate != self._input_resampler._input_rate:
