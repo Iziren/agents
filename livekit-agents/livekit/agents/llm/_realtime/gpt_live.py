@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import time
+from collections import deque
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypedDict
@@ -422,6 +423,9 @@ class GPTLiveSession(
         self._speech: dict[Role, _Speech] = {}
         # learns the caller's own noise floor, so a noisy line still has a silence to measure
         self._input_gate = llm.AdaptiveNoiseGate(min_silence_duration=_MIN_SILENCE_DURATION)
+        # the caller's latest audio, one silence long: what a gate relearning the floor starts on
+        self._input_tail: deque[rtc.AudioFrame] = deque()
+        self._input_tail_duration = 0.0
 
         # delegation_id -> call_ids of its response that has not completed yet; on completion the
         # call_ids move to the open set, and stay there until each output is sent to the backend.
@@ -1073,13 +1077,20 @@ class GPTLiveSession(
         # with the gate closed or the service hearing silence. fragments arrive about as far
         # apart as the pause, so their spacing alone would split a caller mid-sentence
         audible = self._input_gate.update(frame) and not self._input_muted
+        self._input_tail.append(frame)
+        self._input_tail_duration += frame.duration
+        while self._input_tail_duration - self._input_tail[0].duration >= _MIN_SILENCE_DURATION:
+            self._input_tail_duration -= self._input_tail.popleft().duration
+
         if (speech := self._speech.get("user")) is not None:
             speech.quiet_ms += round(frame.duration * 1000)
-            if speech.quiet_ms >= _MAX_FRAGMENT_GAP_MS:
-                # only an open gate gets here: it relearns the line's floor from what it carries now
-                self._input_gate = llm.AdaptiveNoiseGate(min_silence_duration=_MIN_SILENCE_DURATION)
+            if speech.quiet_ms >= _MIN_SILENCE_MS and not audible:
                 self._end_speech("user")
-            elif speech.quiet_ms >= _MIN_SILENCE_MS and not audible:
+            elif speech.quiet_ms >= _MAX_FRAGMENT_GAP_MS:
+                # the gate is open on what is not the caller, so it relearns the floor from it
+                self._input_gate = llm.AdaptiveNoiseGate(min_silence_duration=_MIN_SILENCE_DURATION)
+                for tail in self._input_tail:
+                    self._input_gate.update(tail)
                 self._end_speech("user")
 
         if self._input_resampler and frame.sample_rate != self._input_resampler._input_rate:
@@ -1132,10 +1143,10 @@ class GPTLiveSession(
 
         The state is remembered and re-applied to any session a reconnect opens.
         """
-        self._input_muted = True
-        # the service hears silence only from here, not over what was pushed before
-        if (speech := self._speech.get("user")) is not None:
+        # the service hears silence only from the mute, not over what was pushed before it
+        if not self._input_muted and (speech := self._speech.get("user")) is not None:
             speech.quiet_ms = 0
+        self._input_muted = True
         self.send_event(types.InputAudioMuteEvent(event_id=utils.shortuuid("mute_")))
 
     def unmute_input(self) -> None:

@@ -1569,6 +1569,7 @@ async def test_a_caller_the_service_cannot_hear_loses_the_turn_to_the_pause(
 
         for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100) - 1):
             session.push_audio(_pcm(0.05))
+            session.mute_input()
         assert "input_speech_stopped" not in [name for name, _ in events]
         session.push_audio(_pcm(0.05))
         assert [name for name, _ in events[-2:]] == [
@@ -1584,7 +1585,7 @@ async def test_a_line_that_got_noisier_still_ends_the_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The gate holds open on noise above the floor it learned, so fragments stopping must end
-    the turn on their own, and the next turn ends on the pause again."""
+    the turn on their own, and the next turn keeps the caller and ends on the pause again."""
     _connect_hook(monkeypatch)
 
     model = GPTLiveModel(api_key="sk-test")
@@ -1611,7 +1612,12 @@ async def test_a_line_that_got_noisier_still_ends_the_turn(
         ]
 
         session._handle_event(_transcript("user", " Yes", 9000))
-        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+        for level in (0.007, 0.01, 0.014, 0.02, 0.03):
+            session.push_audio(_pcm(level))
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100) + 1):
+            session.push_audio(_pcm(0.05))
+        assert [name for name, _ in events].count("input_speech_stopped") == 1
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100) + 1):
             session.push_audio(_pcm(0.005))
         assert [name for name, _ in events[-2:]] == [
             "input_audio_transcription_completed",
