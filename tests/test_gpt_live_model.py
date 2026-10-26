@@ -1548,6 +1548,65 @@ async def test_a_caller_still_talking_keeps_the_turn_between_fragments(
         await model.aclose()
 
 
+async def test_a_caller_the_service_cannot_hear_loses_the_turn_to_the_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Muted, the service hears silence whatever the microphone carries."""
+    _connect_hook(monkeypatch)
+
+    model = GPTLiveModel(api_key="sk-test")
+    session = model.session()
+    events = _user_events(session)
+    try:
+        await session._update_session()
+        await asyncio.sleep(0.05)
+        for _ in range(20):
+            session.push_audio(_silence(100))
+        session._handle_event(_transcript("user", " My date of birth is June", 1800))
+        session.mute_input()
+
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+            session.push_audio(_pcm(0.05))
+        assert [name for name, _ in events[-2:]] == [
+            "input_audio_transcription_completed",
+            "input_speech_stopped",
+        ]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_line_that_got_noisier_still_ends_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate holds open on noise above the floor it learned, so fragments stopping must end
+    the turn on their own."""
+    _connect_hook(monkeypatch)
+
+    model = GPTLiveModel(api_key="sk-test")
+    session = model.session()
+    events = _user_events(session)
+    try:
+        await session._update_session()
+        await asyncio.sleep(0.05)
+        for _ in range(20):
+            session.push_audio(_pcm(0.001))
+        session._handle_event(_transcript("user", " My date of birth is June", 1800))
+        session.push_audio(_pcm(0.05))
+
+        for _ in range(int(gpt_live_model._MAX_FRAGMENT_GAP_MS // 100) - 2):
+            session.push_audio(_pcm(0.005))
+        assert "input_speech_stopped" not in [name for name, _ in events]
+        session.push_audio(_pcm(0.005))
+        assert [name for name, _ in events[-2:]] == [
+            "input_audio_transcription_completed",
+            "input_speech_stopped",
+        ]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
 async def test_a_pause_on_the_models_clock_splits_fragments_that_arrive_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

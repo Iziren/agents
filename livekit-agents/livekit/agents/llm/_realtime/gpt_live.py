@@ -48,6 +48,9 @@ _SILENCE_RMS = 0.0006
 # long enough that a pause between sentences does not split an utterance in two
 _MIN_SILENCE_DURATION = 0.8
 _MIN_SILENCE_MS = _MIN_SILENCE_DURATION * 1000
+# a caller still talking gets a fragment well within this, so past it the turn ends even with the
+# caller's gate open: the gate learns only while closed, and a line that got noisier holds it open
+_MAX_FRAGMENT_GAP_MS = 3000
 
 # the asks generate_reply sends as commentary. each ends with the same two sentences, which make
 # the model speak now rather than wait for the caller; what precedes them says what to speak
@@ -1067,12 +1070,14 @@ class GPTLiveSession(
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         # the caller's turn ends on their own audio: this much pushed since their last fragment,
-        # with the gate closed. fragments arrive about as far apart as the pause, so their
-        # spacing alone would split a caller mid-sentence
-        audible = self._input_gate.update(frame)
+        # with the gate closed or the service hearing silence. fragments arrive about as far
+        # apart as the pause, so their spacing alone would split a caller mid-sentence
+        audible = self._input_gate.update(frame) and not self._input_muted
         if (speech := self._speech.get("user")) is not None:
             speech.quiet_ms += round(frame.duration * 1000)
-            if speech.quiet_ms >= _MIN_SILENCE_MS and not audible:
+            if (
+                speech.quiet_ms >= _MIN_SILENCE_MS and not audible
+            ) or speech.quiet_ms >= _MAX_FRAGMENT_GAP_MS:
                 self._end_speech("user")
 
         if self._input_resampler and frame.sample_rate != self._input_resampler._input_rate:
