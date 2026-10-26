@@ -99,7 +99,8 @@ class RunHooks:
 
     ``boundary`` is awaited before each model call; ``True`` makes the run yield there with what
     ran so far and no reply (the ``interrupt`` policy of plan 3.3.4). ``on_result`` receives every
-    result, so the door can commit what the run added without the handler forwarding it.
+    result, so the door can commit what the run added without the handler forwarding it;
+    ``on_item`` each item as the run adds it, so a run that raises still commits what it ran.
     ``on_update`` receives a tool's ``ctx.update(text)``: the door forwards it as progress, a
     ``working`` frame on the text door, speech on a call. ``on_token`` receives the model's text
     as it arrives, so the text door shows the reply as it is written. ``thread_id`` is the session the run
@@ -115,6 +116,7 @@ class RunHooks:
 
     boundary: Callable[[], Awaitable[bool]] | None = None
     on_result: Callable[[RunResult[Any]], None] | None = None
+    on_item: Callable[[ChatItem], None] | None = None
     on_update: Callable[[str], Any] | None = None
     on_token: Callable[[str], Awaitable[None]] | None = None
     thread_id: str | None = None
@@ -373,14 +375,16 @@ class AgentRun(Generic[Run_T]):
         # what this run adds, in order; the instructions are rendered per request and are
         # not part of it
         new_items: list[ChatItem] = []
+        hooks = None if self._nested else _run_hooks.get()
 
         def record(item: ChatItem) -> None:
             chat_ctx.insert(item)
             new_items.append(item)
+            if hooks is not None and hooks.on_item is not None:
+                hooks.on_item(item)
 
         # what reached the person exactly as written, in order: it leads the answer
         verbatim: list[str] = []
-        hooks = None if self._nested else _run_hooks.get()
         # a run another agent asked does not phrase: the agent facing the person does
         facing_person = hooks is None or not hooks.delegated
 
